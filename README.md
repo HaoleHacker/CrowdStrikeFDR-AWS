@@ -10,4 +10,4 @@ I used CrowdStrike's sample as the launch point to create a python 3.7 (also tes
 2. Run the cloudformation template.
 3. Validate the components were all created as expected and you have data flowing into your bucket.
 
-# NOTE: This template was not provided or supported by CrowdStrike.  
+NOTE: This template was not provided or supported by CrowdStrike.  
