@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS Lambda consumer for Falcon Data Replicator
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: S3 Bucket Name
+        Parameters:
+          - BucketName
+      - Label:
+          default: IAM Role Name
+        Parameters:
+          - RoleName
+      - Label:
+          default: Lambda Function Name
+        Parameters:
+          - LambdaName
+      - Label:
+          default: Cloudwatch Event Rule Name
+        Parameters:
+          - EventName
+      - Label:
+          default: IAM UserName
+        Parameters:
+          - IAMUserName
+      - Label:
+          default: Secrets Manager ARN
+        Parameters:
+          - SecretARN
+      - Label:
+          default: Secret Name
+        Parameters:
+          - SecretName
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Enter the name of the S3 bucket in this account which will locally store the FDR data.
+
+  RoleName:
+    Type: String
+    Description: Enter the name of the IAM role in this account which will have access to the Secret, Lambda, and S3 bucket.
+
+  LambdaName:
+    Type: String
+    Description: Enter the name of the lambda function to be created in this account.
+    
+  EventName:
+    Type: String
+    Description: Enter the name of the Cloudwatch event rule to be created in this account.
+
+  IAMUserName:
+    Type: String
+    Description: Enter the name of the IAM User to be created in this account for Splunk access.
+
+  SecretARN:
+    Type: String
+    Description: Enter the ARN of your Secrets Manager secret containing the queue, key, and secret from CrowdStrike.
+
+  SecretName:
+    Type: String
+    Description: Enter the name of your Secrets Manager secret containing the queue, key, and secret from CrowdStrike.
+
+Resources:
+
+  LocalBucket:
+    Type: AWS::S3::Bucket
+    Properties: 
+      BucketName: 
+        Ref: BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: 
+          -
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          -
+            ExpirationInDays: '30'
+            Status: "Enabled"
+
+  IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: FDR-S3-Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+        - PolicyName: FDR-Secret-Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetResourcePolicy
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecretVersionIds
+                Resource:
+                  Ref: SecretARN
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      RoleName: 
+        Ref: RoleName
+  
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - IAMRole
+      - LocalBucket
+    Properties:
+      FunctionName: 
+        Ref: LambdaName
+      Description: CrowdStrike Falcon Data Replicator Automation
+      Environment:
+        Variables:
+          DestinationBucketName: !Ref BucketName
+          Secret_Name: !Ref SecretName
+          Region_Name: !Ref "AWS::Region"
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      Timeout: 60
+      Role: !GetAtt IAMRole.Arn
+      Code: 
+        ZipFile:  |
+          # Lambda function to download files from CrowdStrike Falcon Data Replicator to local S3 bucket
+
+          import json
+          import boto3
+          import base64
+          import time
+          import os
+          from botocore.exceptions import ClientError
+
+          # Code provided by AWS Secrets Manager, which stores CrowdStrike provided key and secret
+          def get_secret():
+
+              secret_name = os.environ['Secret_Name']
+              region_name = os.environ['Region_Name']
+
+              # Create a Secrets Manager client
+              session = boto3.session.Session()
+              client = session.client(
+                  service_name='secretsmanager',
+                  region_name=region_name
+              )
+
+              try:
+                  get_secret_value_response = client.get_secret_value(
+                      SecretId=secret_name
+                  )
+              except ClientError as e:
+                  if e.response['Error']['Code'] == 'DecryptionFailureException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidParameterException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'InvalidRequestException':
+                      raise e
+                  elif e.response['Error']['Code'] == 'ResourceNotFoundException':
+                      raise e
+              else:
+                  if 'SecretString' in get_secret_value_response:
+                      secret = get_secret_value_response['SecretString']
+                  else:
+                      secret = base64.b64decode(get_secret_value_response['SecretBinary'])
+              return json.loads(secret)
+                      
+          # Initial function called, which downloads event from SQS and calls download_message_files with parsed json as input
+          def lambda_handler(event, context):
+
+              creds = (get_secret())
+              AWS_KEY = creds["key"]
+              AWS_SECRET = creds["secret"]
+              AWS_QUEUE = creds["queue"]
+              VISIBILITY_TIMEOUT = 300
+
+              sqs = boto3.resource('sqs', region_name='us-west-1', aws_access_key_id=AWS_KEY, aws_secret_access_key=AWS_SECRET)
+              queue = sqs.Queue(url=AWS_QUEUE)
+              sleep_time = 1
+              for msg in queue.receive_messages(VisibilityTimeout=VISIBILITY_TIMEOUT):
+                  body = json.loads(msg.body)  # grab the actual message body
+                  download_message_files(body,AWS_KEY,AWS_SECRET)
+                  # msg.delete() must be called or the message will be returned to the SQS queue after VISIBILITY_TIMEOUT seconds
+                  msg.delete()
+                  time.sleep(sleep_time)
+
+          # Downloads file to lambda /tmp (512MB limit) and uploads to local bucket
+          def download_message_files(msg, AWS_KEY, AWS_SECRET):
+              for file in msg['files']:
+                  destBucket = os.environ['DestinationBucketName']
+                  
+                  #CrowdStrike S3 source
+                  s3Source = boto3.client('s3', region_name='us-west-1', aws_access_key_id=AWS_KEY, aws_secret_access_key=AWS_SECRET)
+                  path = file.get('path')
+                  file = path.split('/')[-1] #lambda's /tmp will not accept multiple directories, so we strip them for the download and replace with the upload
+                  sourceBucket = msg['bucket']
+                  s3Source.download_file(sourceBucket,path,'/tmp/'+file) 
+                  
+                  #Local bucket destination
+                  s3Dest = boto3.client('s3')
+                  s3Dest.upload_file('/tmp/'+file,destBucket,path)
+                  
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    DependsOn: IAMRole
+    Properties: 
+      Description: !Sub 'Event trigger for ${LambdaName}'
+      Name: 
+        Ref: EventName
+      ScheduleExpression: "rate(1 minute)"
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "LambdaFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: 
+        Ref: "LambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRule"
+          - "Arn"
+
+  IAMUser:
+    Type: AWS::IAM::User
+    DependsOn: 
+      - LocalBucket
+    Properties: 
+      UserName:
+        Ref: IAMUserName
+      Policies:
+        - PolicyName: FDR-Bucket-Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+        - PolicyName: FDR-List-Buckets
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource:
+                  - 'arn:aws:s3:::*'
